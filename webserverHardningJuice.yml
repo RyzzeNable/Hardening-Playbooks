@@ -1,0 +1,794 @@
+---
+  - name: Webserver Hardning One
+    hosts: webserver
+    become: yes
+    vars:
+      backup_nameservers:
+        - "8.8.8.8"
+        - "8.8.4.4"
+      protocols_to_disable:
+        - dccp /bin/true
+        - sctp /bin/true
+        - rds /bin/true
+        - tipc /bin/true
+        - firewire-core /bin/true
+      external_log_host: "192.168.84.133"
+      grub_plain_password: "#tomas123"
+      config_lines:
+        - { regex: '^ENCRYPT_METHOD', line: 'ENCRYPT_METHOD SHA512' }
+        - { regex: '^SHA_CRYPT_MIN_ROUNDS', line: 'SHA_CRYPT_MIN_ROUNDS 5000' }
+        - { regex: '^SHA_CRYPT_MAX_ROUNDS', line: 'SHA_CRYPT_MAX_ROUNDS 5000' }
+        - { regex: '^PASS_MIN_DAYS', line: 'PASS_MIN_DAYS 7' }
+        - { regex: '^PASS_MAX_DAYS', line: 'PASS_MAX_DAYS 90' }
+        - { regex: '^UMASK', line: 'UMASK 027' }
+    tasks:
+
+# Operative System Hardning
+
+      - name: Get the home directory
+        command: "bash -c 'echo ~{{ ansible_user }}'"
+        register: home_dir
+
+      - name: Update the apt package index
+        apt:
+          update_cache: yes
+
+      - name: Upgrade all packages to the latest version
+        apt:
+          upgrade: dist
+
+      - name: Remove unnecessary packages
+        apt:
+          autoremove: yes
+
+      - name: Clean up unused package cache
+        apt:
+          autoclean: yes
+
+      - name: Remove unnecessary packages
+        shell: "apt autoremove --purge -y"
+
+      - name: Remove unsecure services
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server netcat -y"
+
+      - name: Install needed packages
+        command: "apt-get install nftables fail2ban nginx openssl certbot debsums aptitude apt-show-versions apt-listbugs python3-certbot-nginx apparmor apparmor-utils unattended-upgrades libpam-tmpdir apt-listbugs needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon bison build-essential ca-certificates curl dh-autoreconf doxygen flex gawk git iputils-ping libcurl4-gnutls-dev libexpat1-dev libgeoip-dev liblmdb-dev libpcre3-dev libssl-dev libtool libxml2 libxml2-dev libyajl-dev locales lua5.3-dev pkg-config wget zlib1g-dev libxslt1-dev libgd-dev libperl-dev libpwquality-tools aide arpwatch curl ca-certificates -y"
+
+      - name: Purge old/removed packages
+        command: "aptitude purge '~c' -y"
+
+      - name: Configure debsums cron job
+        copy:
+          dest: /etc/cron.d/debsums-check
+          content: |
+            0 3 * * * root debsums -s
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Enable debsums cron check
+        lineinfile:
+          path: "/etc/default/debsums"
+          regexp: '^CRON_CHECK'
+          line: 'CRON_CHECK=yes'
+
+      - name: Get lynis
+        command: git clone https://github.com/CISOfy/lynis "{{ home_dir.stdout }}/Lynis/"
+
+      - name: Run Need Restart
+        shell: "needrestart"
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nftables.conf
+          dest: /etc/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Generate hashed GRUB password
+        expect:
+          command: grub-mkpasswd-pbkdf2
+          responses:
+            "Enter password:": "{{ grub_plain_password }}"
+            "Reenter password:": "{{ grub_plain_password }}"
+        register: grub_password_hash
+
+      - name: Extract GRUB password hash
+        set_fact:
+          grub_password_output: "{{ grub_password_hash.stdout | regex_search('grub\\.pbkdf2.*') }}"
+
+      - name: Set GRUB password in configuration
+        blockinfile:
+          path: /etc/grub.d/40_custom
+          insertafter: EOF
+          block: |
+            set superusers="root"
+            password_pbkdf2 root {{ grub_password_output }}
+
+      - name: Update GRUB configuration
+        command: update-grub
+
+      - name: Ensure core dumps are disabled in limits.conf
+        lineinfile:
+          path: /etc/security/limits.conf
+          line: "* hard core 0"
+          state: present
+
+      - name: Check for any other core dump configurations
+        shell: grep -r "core" /etc/security/limits.d/
+        register: core_config_check
+        failed_when: core_config_check.rc != 0 and core_config_check.stdout != ""
+
+      - name: Configure PAM for password quality enforcement
+        lineinfile:
+          path: /etc/pam.d/common-password
+          regex: '^password\s+requisite\s+pam_pwquality\.so'
+          line: 'password requisite pam_pwquality.so retry=3 minlen=9 difok=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1'
+          state: present
+
+      - name: Configure login.defs
+        ansible.builtin.lineinfile:
+          path: /etc/login.defs
+          regexp: "{{ item.regex }}"
+          line: "{{ item.line }}"
+          state: present
+        loop: "{{ config_lines }}"
+
+      - name: Update existing users
+        command: "sudo chage -m 7 -M 90 webserver"
+
+      - name: Verify packages
+        command: "sudo debsums -s"
+
+      - name: Create modprobe blacklist file for USB storage
+        copy:
+          dest: /etc/modprobe.d/blacklist-usb-storage.conf
+          content: |
+            install usb-storege /bin/true
+            blacklist usb-storage /bin/true
+
+      - name: Create protocols blacklist file
+        command: touch /etc/modprobe.d/blacklist-protocols.conf
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "blacklist {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "install {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Update initramfs
+        command: "update-initramfs -u"
+
+      - name: Create cramfs.conf file
+        command: "touch /etc/modprobe.d/cramfs.conf"
+
+      - name: Add cramfs to modprobe blacklist
+        lineinfile:
+          path: "/etc/modprobe.d/cramfs.conf"
+          line: "install cramfs /bin/false"
+          state: present
+
+      - name: Check for existing nameservers
+        shell: grep -E '^nameserver' /etc/resolv.conf
+        register: existing_nameservers
+
+      - name: Add backup nameservers to /etc/resolv.conf
+        lineinfile:
+          path: /etc/resolv.conf
+          line: "nameserver {{ item }}"
+          state: present
+        with_items: "{{ backup_nameservers }}"
+        when: "item not in existing_nameservers.stdout_lines"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Update signature database
+        command: "sudo freshclam"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          enabled: yes
+          state: started
+
+      - name: Create the directory for Docker keyrings
+        file:
+          path: /etc/apt/keyrings
+          state: directory
+          mode: '0755'
+
+      - name: Download Docker's official GPG key
+        get_url:
+          url: https://download.docker.com/linux/debian/gpg
+          dest: /etc/apt/keyrings/docker.asc
+          mode: '0644'
+
+      - name: Add Docker repository to APT sources
+        copy:
+          content: |
+            deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(lsb_release -cs) stable
+          dest: /etc/apt/sources.list.d/docker.list
+
+      - name: Update APT package index after adding Docker repository
+        apt:
+          update_cache: yes
+
+      - name: Install Docker Last Version
+        command: "apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
+
+
+# User and Access management
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/webserver/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Restart SSH service
+        service:
+          name: sshd
+          state: restarted
+
+      - name: Wait for the SSH service to restart on the new port
+        wait_for:
+          host: "{{ inventory_hostname }}"
+          port: 3025
+          delay: 10
+          timeout: 30
+          state: started
+
+      - name: Reset connection for the new SSH port
+        meta: reset_connection
+
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        command: "systemctl start nftables"
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Debug nftables result
+        debug:
+          var: nftables_result
+
+      - name: Enable nftables service
+        command: "systemctl enable nftables"
+
+      - name: Apply nftables configuration
+        command: "nft -f /etc/nftables.conf"
+
+      - name: Get users with password
+        shell: "awk -F: '{ if ($2 != \"*\" && $2 != \"!\" ) print $1 }' /etc/shadow"
+        register: users
+
+      - name: Set account expiration dates
+        user:
+          name: "{{ item }}"
+          expires: 1735689600
+        loop: "{{ users.stdout_lines }}"
+
+      - name: Ensure proper permissions for /etc/passwd
+        file:
+          path: /etc/passwd
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure proper permissions for /etc/shadow
+        file:
+          path: /etc/shadow
+          owner: root
+          group: shadow
+          mode: '0640'
+
+      - name: Set minimum password length
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minlen = .*'
+          line: 'minlen = 9'
+
+      - name: Set password complexity
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minclass = .*'
+          line: 'minclass = 3'
+
+      - name: Add a banner to /etc/issue
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue"
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Add a banner to /etc/issue
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue.net"
+          owner: root
+          group: root
+          mode: '0600'
+
+# Network Layer Hardning
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/webserver/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply configuration
+        shell: "sysctl -p"
+
+      - name: Copy fail2ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/webserver/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-http-auth file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-http-auth.conf
+          dest: /etc/fail2ban/nginx-http-auth.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-badbots.conf file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-badbots.conf
+          dest: /etc/fail2ban/nginx-badbots.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-badbots.conf file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-badbots.conf
+          dest: /etc/fail2ban/filter.d/nginx-badbots.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-login-rest.conf file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-login-rest.conf
+          dest: /etc/fail2ban/nginx-login-rest.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-login-rest.conf file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-login-rest.conf
+          dest: /etc/fail2ban/filter.d/nginx-login-rest.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Run fail2ban-regex to test configuration
+        command: "sudo fail2ban-regex /var/log/nginx/access.log /etc/fail2ban/filter.d/nginx-login-rest.conf"
+
+      - name: Copy nginx-noscript  file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-noscript.conf
+          dest: /etc/fail2ban/nginx-noscript.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-nohome file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-nohome.conf
+          dest: /etc/fail2ban/nginx-nohome.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-nohome file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-nohome.conf
+          dest: /etc/fail2ban/filter.d/nginx-nohome.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-noproxy  file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-noproxy.conf
+          dest: /etc/fail2ban/nginx-noproxy.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx-noproxy  file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx-noproxy.conf
+          dest: /etc/fail2ban/filter.d/nginx-noproxy.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure allowipv6 is set to 'no' in fail2ban.conf
+        lineinfile:
+          path: "/etc/fail2ban/fail2ban.conf"
+          regexp: '^#allowipv6 = auto'
+          line: 'allowipv6 = no'
+          state: present
+
+      - name: Start and enabale fail2ban  service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+# Application layer Hardning
+
+      - name: Create private directory
+        file:
+          path: /etc/ssl/private
+          state: directory
+          mode: '0750'
+
+      - name: Create Self-Signed Certificate
+        shell: "openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout /etc/ssl/private/nginx-selfsigned.key -out /etc/ssl/certs/nginx-selfsigned.crt -subj '/C=PT/ST=Bragança/L=Bragança/O=IPB/OU=School/CN=IPB/emailAddress=email@email.com'"
+
+      - name: Generate strong Diffie-Hellman group
+        shell: "openssl dhparam -out /etc/ssl/certs/dhparam.pem 2048"
+
+      - name: Create SSL configuration snippet
+        copy:
+          dest: /etc/nginx/snippets/self-signed.conf
+          content: |
+            ssl_certificate /etc/ssl/certs/nginx-selfsigned.crt;
+            ssl_certificate_key /etc/ssl/private/nginx-selfsigned.key;
+            ssl_dhparam /etc/ssl/certs/dhparam.pem;
+
+      - name: Create SSL parameters snippet
+        copy:
+          dest: /etc/nginx/snippets/ssl-params.conf
+          content: |
+            ssl_protocols TLSv1.2 TLSv1.3;
+            ssl_prefer_server_ciphers on;
+            ssl_ciphers EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH;
+            ssl_session_timeout 1d;
+            ssl_session_cache shared:SSL:10m;
+            ssl_session_tickets off;
+            ssl_stapling on;
+            ssl_stapling_verify on;
+            resolver 1.1.1.1 8.8.8.8 valid=300s;
+            resolver_timeout 5s;
+
+      - name: Copy nginx configuration for 443
+        copy:
+          src: /etc/ansible/playbooks/webserver/default
+          dest: /etc/nginx/sites-available/default
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Copy nginx configuration file
+        copy:
+          src: /etc/ansible/playbooks/webserver/nginx.conf
+          dest: /etc/nginx/nginx.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Locate PHP configuration files
+        shell: grep -l "allow_url_fopen" /etc/php/*/cli/php.ini /etc/php/*/apache2/php.ini /etc/php/*/fpm/php.ini || true
+        register: php_ini_files
+
+      - name: Disable allow_url_fopen in each PHP configuration file
+        lineinfile:
+          path: "{{ item }}"
+          regexp: '^allow_url_fopen ='
+          line: 'allow_url_fopen = Off'
+          state: present
+        with_items: "{{ php_ini_files.stdout_lines }}"
+
+      - name: Create a folder on the desktop
+        file:
+          path: "{{ home_dir.stdout }}/opt"
+          state: directory
+          mode: '0755'
+
+      - name: Clone ModSecurity Directory
+        command: "git clone https://github.com/SpiderLabs/ModSecurity {{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run submodule init in the ModSecurity directory
+        command: "git submodule init"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run submodule update in the ModSecurity directory
+        command: "git submodule update"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run build in the ModSecurity directory
+        command: "./build.sh"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run configure in the ModSecurity directory
+        command: "./configure"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run make in the ModSecurity directory
+        command: "make"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Run make install in the ModSecurity directory
+        command: "make install"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/ModSecurity"
+
+      - name: Clone ModSecurity Directory
+        command: "git clone --depth 1 https://github.com/SpiderLabs/ModSecurity-nginx.git {{ home_dir.stdout }}/opt/ModSecurity-nginx"
+
+      - name: Get nginx directory version 1.22.1
+        command: "wget -P {{ home_dir.stdout }}/opt http://nginx.org/download/nginx-1.22.1.tar.gz"
+
+      - name: Extract the nginx tarball
+        command: "tar -xvzmf nginx-1.22.1.tar.gz"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt"
+
+      - name: Compile Modsecurity module
+        command: "./configure --with-cc-opt='-g -O2 -ffile-prefix-map=/build/nginx-AoTv4W/nginx-1.22.1=. -fstack-protector-strong -Wformat -Werror=format-security -fPIC -Wdate-time -D_FORTIFY_SOURCE=2' --with-ld-opt='-Wl,-z,relro -Wl,-z,now -fPIC' --prefix=/usr/share/nginx --conf-path=/etc/nginx/nginx.conf --http-log-path=/var/log/nginx/access.log --error-log-path=stderr --lock-path=/var/lock/nginx.lock --pid-path=/run/nginx.pid --modules-path=/usr/lib/nginx/modules --http-client-body-temp-path=/var/lib/nginx/body --http-fastcgi-temp-path=/var/lib/nginx/fastcgi --http-proxy-temp-path=/var/lib/nginx/proxy --http-scgi-temp-path=/var/lib/nginx/scgi --http-uwsgi-temp-path=/var/lib/nginx/uwsgi --with-compat --with-debug --with-pcre-jit --with-http_ssl_module --with-http_stub_status_module --with-http_realip_module --with-http_auth_request_module --with-http_v2_module --with-http_dav_module --with-http_slice_module --with-threads --with-http_addition_module --with-http_flv_module --with-http_gunzip_module --with-http_gzip_static_module --with-http_mp4_module --with-http_random_index_module --with-http_secure_link_module --with-http_sub_module --with-mail_ssl_module --with-stream_ssl_module --with-stream_ssl_preread_module --with-stream_realip_module --with-http_geoip_module=dynamic --with-http_image_filter_module=dynamic --with-http_perl_module=dynamic --with-http_xslt_module=dynamic --with-mail=dynamic --with-stream=dynamic --with-stream_geoip_module=dynamic --add-dynamic-module=../ModSecurity-nginx"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/nginx-1.22.1"
+
+      - name: Run make modules in the nginx directory
+        command: "make modules"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/nginx-1.22.1"
+
+      - name: Creates module directory
+        file:
+          path: "/etc/nginx/modules"
+          state: directory
+
+      - name: Copy ngx http ModSecurity module
+        command: "cp objs/ngx_http_modsecurity_module.so /etc/nginx/modules"
+        args:
+          chdir: "{{ home_dir.stdout }}/opt/nginx-1.22.1"
+
+      - name: Remove old modsecurity-crs
+        command: "rm -rf /usr/share/modsecurity-crs"
+
+      - name: Clone Core Ruleset configuration
+        command: "git clone https://github.com/coreruleset/coreruleset /usr/local/modsecurity-crs"
+
+      - name: Copy crs-setup config file
+        command: "mv /usr/local/modsecurity-crs/crs-setup.conf.example /usr/local/modsecurity-crs/crs-setup.conf"
+
+      - name: Copy Exclusion rules file
+        command: "mv /usr/local/modsecurity-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf.example /usr/local/modsecurity-crs/rules/REQUEST-900-EXCLUSION-RULES-BEFORE-CRS.conf"
+
+      - name: Create modsec directory
+        file:
+          path: "/etc/nginx/modsec"
+          state: directory
+
+      - name: Copy unicode mapping file
+        command: "cp {{ home_dir.stdout }}/opt/ModSecurity/unicode.mapping /etc/nginx/modsec"
+
+      - name: Copy modsecurity config file
+        command: "cp {{ home_dir.stdout }}/opt/ModSecurity/modsecurity.conf-recommended /etc/nginx/modsec/modsecurity.conf"
+
+      - name: Ensure SecRuleEngine is set to On
+        lineinfile:
+         path: "/etc/nginx/modsec/modsecurity.conf"
+         regexp: '^SecRuleEngine'
+         line: 'SecRuleEngine On'
+
+      - name: Copy main.conf configuration file
+        copy:
+          src: "/etc/ansible/playbooks/webserver/main.conf"
+          dest: "/etc/nginx/modsec/main.conf"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Test Nginx configuration
+        command: nginx -t
+
+# Application Dependencies Hardning
+
+      - name: Change premissions html directory
+        command: "chmod -R 750 /var/www/html"
+
+      - name: Change premisions sudoers.d file
+        command: "chmod -R 440 /etc/sudoers.d"
+
+      - name: Restrict directory premissions
+        command: "chown -R www-data:www-data /var/www/html"
+
+      - name: Set owner and permissions for cron directories
+        file:
+          path: "{{ item }}"
+          owner: root
+          group: root
+          mode: '0700'
+          state: directory
+        with_items:
+          - /etc/cron.d
+          - /etc/cron.daily
+          - /etc/cron.hourly
+          - /etc/cron.weekly
+          - /etc/cron.monthly
+
+      - name: Set owner and permissions for crontab file
+        file:
+          path: "/etc/crontab"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Get list of files in cron.d
+        stat:
+          path: "{{ item }}"
+        with_items: "{{ lookup('fileglob', '/etc/cron.d/*', wantlist=True) }}"
+        register: cron_d_files
+
+      - name: Set permissions for existing cron.d files
+        file:
+          path: "{{ item.stat.path }}"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+        with_items: "{{ cron_d_files.results }}"
+        when: item.stat.exists
+
+      - name: Set secure permissions for grub.cfg
+        file:
+          path: "/boot/grub/grub.cfg"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Initialize AIDE database
+        command: "aide --init --config /etc/aide/aide.conf"
+
+      - name: Move the AIDE database to default location
+        command: "cp -p /var/lib/aide/aide.db.new /var/lib/aide/aide.db"
+
+      - name: Ensure AIDE excludes specific directories
+        blockinfile:
+          path: "/etc/aide/aide.conf"
+          block: |
+            !/var/log
+            !/var/lib/aide
+            !/var/lib/apt
+            !/var/lib/dpkg
+            !/var/cache
+            !/run
+
+# Monitoring and Logging
+
+      - name: Add external logging configuration
+        lineinfile:
+          path: /etc/rsyslog.conf
+          line: "*.* @{{ external_log_host }}"
+          state: present
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: Update auditd configuration
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file = .*'
+          line: 'max_log_file = 50'
+
+      - name: Ensure audit logs are rotated
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file_action = .*'
+          line: 'max_log_file_action = rotate'
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/webserver/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Make sure auditd is started and enabled
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Configure logrotate for syslog
+        copy:
+          dest: /etc/logrotate.d/syslog
+          content: |
+            /var/log/syslog {
+                daily
+                rotate 7
+                compress
+                missingok
+                notifempty
+            }
+
+# Advanced Layer
+
+      - name: Start App Armor service
+        systemd:
+          name: apparmor
+          state: started
+          enabled: true
+
+      - name: Protect nginx with APP-ARMOR
+        shell: "aa-enforce /etc/apparmor.d/usr.sbin.nginx"
+
+      - name: Configure unattended-upgrades
+        shell: "echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections"
+
+      - name: Configure unattended-upgrades
+        shell: "dpkg-reconfigure -f noninteractive unattended-upgrades"
+
+# Restart nginx
+
+      - name: Reload Nginx
+        service:
+          name: nginx
+          state: reloaded
+
+# Restart Host
+
+      - name: Restart Host
+        shell: "reboot"
+

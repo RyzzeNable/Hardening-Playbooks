@@ -1,0 +1,632 @@
+---
+  - name: Admin Hardning One
+    hosts: admin
+    become: yes
+    vars:
+      backup_nameservers:
+        - "8.8.8.8"
+        - "8.8.4.4"
+      protocols_to_disable:
+        - dccp /bin/true
+        - sctp /bin/true
+        - rds /bin/true
+        - tipc /bin/true
+        - firewire-core /bin/true
+      external_log_host: "192.168.84.133"
+      grub_plain_password: "#tomas123"
+      config_lines:
+        - { regex: '^ENCRYPT_METHOD', line: 'ENCRYPT_METHOD SHA512' }
+        - { regex: '^SHA_CRYPT_MIN_ROUNDS', line: 'SHA_CRYPT_MIN_ROUNDS 5000' }
+        - { regex: '^SHA_CRYPT_MAX_ROUNDS', line: 'SHA_CRYPT_MAX_ROUNDS 5000' }
+        - { regex: '^PASS_MIN_DAYS', line: 'PASS_MIN_DAYS 7' }
+        - { regex: '^PASS_MAX_DAYS', line: 'PASS_MAX_DAYS 90' }
+        - { regex: '^UMASK', line: 'UMASK 027' }
+    tasks:
+
+# Operative System Hardning
+
+      - name: Get the home directory
+        command: "bash -c 'echo ~{{ ansible_user }}'"
+        register: home_dir
+
+      - name: Update the apt package index
+        apt:
+          update_cache: yes
+
+      - name: Upgrade all packages to the latest version
+        apt:
+          upgrade: dist
+
+      - name: Remove unnecessary packages
+        apt:
+          autoremove: yes
+
+      - name: Clean up unused package cache
+        apt:
+          autoclean: yes
+
+      - name: Remove unnecessary packages
+        shell: "apt autoremove --purge -y"
+
+      - name: Remove unsecure services
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server netcat -y"
+
+      - name: Stop and disable services
+        systemd:
+          name: "{{ item }}"
+          state: stopped
+          enabled: no
+        loop:
+          - ModemManager.service
+          - cups-browsed.service
+          - postfix@-.service
+          - wpa_supplicant.service
+          - avahi-daemon.service
+        ignore_errors: yes
+
+      - name: Install needed packages
+        command: "apt-get install nftables fail2ban debsums aptitude apt-show-versions apparmor apparmor-utils unattended-upgrades libpam-tmpdir needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon build-essential curl git aide arpwatch rkhunter -y"
+
+      - name: Purge old/removed packages
+        command: "aptitude purge '~c' -y"
+
+      - name: Configure debsums cron job
+        copy:
+          dest: /etc/cron.d/debsums-check
+          content: |
+            0 3 * * * root debsums -s
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Enable debsums cron check
+        lineinfile:
+          path: "/etc/default/debsums"
+          regexp: '^CRON_CHECK'
+          line: 'CRON_CHECK=yes'
+
+      - name: Get lynis
+        command: git clone https://github.com/CISOfy/lynis "{{ home_dir.stdout }}/Lynis/"
+
+      - name: Run Need Restart
+        shell: "needrestart"
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/nftables.conf
+          dest: /etc/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Generate hashed GRUB password
+        expect:
+          command: grub-mkpasswd-pbkdf2
+          responses:
+            "Enter password:": "{{ grub_plain_password }}"
+            "Reenter password:": "{{ grub_plain_password }}"
+        register: grub_password_hash
+
+      - name: Extract GRUB password hash
+        set_fact:
+          grub_password_output: "{{ grub_password_hash.stdout | regex_search('grub\\.pbkdf2.*') }}"
+
+      - name: Set GRUB password in configuration
+        blockinfile:
+          path: /etc/grub.d/40_custom
+          insertafter: EOF
+          block: |
+            set superusers="root"
+            password_pbkdf2 root {{ grub_password_output }}
+
+      - name: Update GRUB configuration
+        command: update-grub
+
+      - name: Ensure core dumps are disabled in limits.conf
+        lineinfile:
+          path: /etc/security/limits.conf
+          line: "* hard core 0"
+          state: present
+
+      - name: Check for any other core dump configurations
+        shell: grep -r "core" /etc/security/limits.d/
+        register: core_config_check
+        failed_when: core_config_check.rc != 0 and core_config_check.stdout != ""
+
+      - name: Configure PAM for password quality enforcement
+        lineinfile:
+          path: /etc/pam.d/common-password
+          regex: '^password\s+requisite\s+pam_pwquality\.so'
+          line: 'password requisite pam_pwquality.so retry=3 minlen=9 difok=3 ucredit=-1 lcredit=-1 dcredit=-1 ocredit=-1'
+          state: present
+
+      - name: Configure login.defs
+        lineinfile:
+          path: /etc/login.defs
+          regexp: "{{ item.regex }}"
+          line: "{{ item.line }}"
+          state: present
+        loop: "{{ config_lines }}"
+
+      - name: Update existing users
+        command: "sudo chage -m 7 -M 90 adminico"
+
+      - name: Verify packages
+        command: "sudo debsums -s"
+
+      - name: Create modprobe blacklist file for USB storage
+        copy:
+          dest: /etc/modprobe.d/blacklist-usb-storage.conf
+          content: |
+            install usb-storege /bin/true
+            blacklist usb-storage /bin/true
+
+      - name: Create protocols blacklist file
+        command: touch /etc/modprobe.d/blacklist-protocols.conf
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "blacklist {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "install {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Update initramfs
+        command: "update-initramfs -u"
+
+      - name: Create cramfs.conf file
+        command: "touch /etc/modprobe.d/cramfs.conf"
+
+      - name: Add cramfs to modprobe blacklist
+        lineinfile:
+          path: "/etc/modprobe.d/cramfs.conf"
+          line: "install cramfs /bin/false"
+          state: present
+
+      - name: Check for existing nameservers
+        shell: grep -E '^nameserver' /etc/resolv.conf
+        register: existing_nameservers
+
+      - name: Add backup nameservers to /etc/resolv.conf
+        lineinfile:
+          path: /etc/resolv.conf
+          line: "nameserver {{ item }}"
+          state: present
+        with_items: "{{ backup_nameservers }}"
+        when: "item not in existing_nameservers.stdout_lines"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Update signature database
+        command: "sudo freshclam"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          enabled: yes
+          state: started
+
+      - name: Backup the current rkhunter configuration file
+        copy:
+          src: /etc/rkhunter.conf
+          dest: /etc/rkhunter.conf.bak
+          backup: yes
+
+      - name: Set UPDATE_MIRRORS to 1
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^UPDATE_MIRRORS'
+          line: 'UPDATE_MIRRORS=1'
+
+      - name: Set MIRRORS_MODE to 0
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^MIRRORS_MODE'
+          line: 'MIRRORS_MODE=0'
+
+      - name: Set WEB_CMD to 1
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^WEB_CMD'
+          line: 'WEB_CMD=""'
+
+      - name: Set CRON_DAILY_RUN to true
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^CRON_DAILY_RUN'
+          line: 'CRON_DAILY_RUN=true'
+
+      - name: Set REPORT_EMAIL to your email address
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^REPORT_EMAIL'
+          line: 'REPORT_EMAIL=a51762@alunos.ipb.pt'
+
+      - name: Set ALLOW_SSH_ROOT_USER to no
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^ALLOW_SSH_ROOT_USER'
+          line: 'ALLOW_SSH_ROOT_USER=no'
+
+      - name: Set ALLOW_SSH_PROT_V1 to 2
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^ALLOW_SSH_PROT_V1'
+          line: 'ALLOW_SSH_PROT_V1=2'
+
+      - name: Set ALLOW_SYSLOG_REMOTE to no
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^ALLOW_SYSLOG_REMOTE'
+          line: 'ALLOW_SYSLOG_REMOTE=no'
+
+      - name: Set USE_SYSLOG to authpriv.notice
+        lineinfile:
+          path: /etc/rkhunter.conf
+          regexp: '^USE_SYSLOG'
+          line: 'USE_SYSLOG=authpriv.notice'
+
+      - name: Update rkhunter database
+        command: "rkhunter --update"
+        ignore_errors: yes
+
+      - name: Uninstall iptables and purge its configuration
+        apt:
+          name: iptables
+          state: absent
+          purge: yes
+        ignore_errors: yes
+
+      - name: Ensure CUPS service is stopped
+        systemd:
+          name: cups
+          state: stopped
+          enabled: no
+        ignore_errors: yes
+
+      - name: Mask the CUPS service to prevent it from starting
+        systemd:
+          masked: yes
+        ignore_errors: yes
+
+# User and Access management
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Replace ListenStream port in ssh.socket
+        lineinfile:
+          path: /lib/systemd/system/ssh.socket
+          regexp: '^ListenStream='
+          line: 'ListenStream=3025'
+          backrefs: yes
+
+      - name: Add ListenStream=3025 to 00-socket.conf
+        blockinfile:
+          path: /etc/systemd/system/ssh.service.d/00-socket.conf
+          create: yes
+          block: |
+            [Socket]
+            ListenStream=3025
+
+      - name: Reload systemd manager configuration
+        command: systemctl daemon-reload
+
+      - name: Restart ssh.socket and ssh services
+        systemd:
+          name: "{{ item }}"
+          state: restarted
+        loop:
+          - ssh.socket
+          - ssh
+
+      - name: Wait for the SSH service to restart on the new port
+        wait_for:
+          host: "{{ inventory_hostname }}"
+          port: 3025
+          delay: 10
+          timeout: 30
+          state: started
+
+      - name: Reset connection for the new SSH port
+        meta: reset_connection
+
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        command: "systemctl start nftables"
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Debug nftables result
+        debug:
+          var: nftables_result
+
+      - name: Enable nftables service
+        command: "systemctl enable nftables"
+
+      - name: Apply nftables configuration
+        command: "nft -f /etc/nftables.conf"
+
+      - name: Get users with password
+        shell: "awk -F: '{ if ($2 != \"*\" && $2 != \"!\" ) print $1 }' /etc/shadow"
+        register: users
+
+      - name: Set account expiration dates
+        user:
+          name: "{{ item }}"
+          expires: 1735689600
+        loop: "{{ users.stdout_lines }}"
+
+      - name: Ensure proper permissions for /etc/passwd
+        file:
+          path: /etc/passwd
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure proper permissions for /etc/shadow
+        file:
+          path: /etc/shadow
+          owner: root
+          group: shadow
+          mode: '0640'
+
+      - name: Set minimum password length
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minlen = .*'
+          line: 'minlen = 9'
+
+      - name: Set password complexity
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minclass = .*'
+          line: 'minclass = 3'
+
+      - name: Add a banner to /etc/issue
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue"
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Add a banner to /etc/issue
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue.net"
+          owner: root
+          group: root
+          mode: '0600'
+
+# Network Layer Hardning
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply configuration
+        shell: "sysctl -p"
+
+      - name: Copy fail2ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure allowipv6 is set to 'no' in fail2ban.conf
+        lineinfile:
+          path: "/etc/fail2ban/fail2ban.conf"
+          regexp: '^#allowipv6 = auto'
+          line: 'allowipv6 = no'
+          state: present
+
+      - name: Start and enabale fail2ban  service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+# Application layer Hardning
+
+      - name: Locate PHP configuration files
+        shell: grep -l "allow_url_fopen" /etc/php/*/cli/php.ini /etc/php/*/apache2/php.ini /etc/php/*/fpm/php.ini || true
+        register: php_ini_files
+
+      - name: Disable allow_url_fopen in each PHP configuration file
+        lineinfile:
+          path: "{{ item }}"
+          regexp: '^allow_url_fopen ='
+          line: 'allow_url_fopen = Off'
+          state: present
+        with_items: "{{ php_ini_files.stdout_lines }}"
+
+# Application Dependencies Hardning
+
+      - name: Change premisions sudoers.d file
+        command: "chmod -R 750 /etc/sudoers.d"
+
+      - name: Change permission README file
+        command: "chmod -R 750 /etc/sudoers.d/README"
+
+      - name: Set owner and permissions for cron directories
+        file:
+          path: "{{ item }}"
+          owner: root
+          group: root
+          mode: '0700'
+          state: directory
+        with_items:
+          - /etc/cron.d
+          - /etc/cron.daily
+          - /etc/cron.hourly
+          - /etc/cron.weekly
+          - /etc/cron.monthly
+
+      - name: Set owner and permissions for crontab file
+        file:
+          path: "/etc/crontab"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Get list of files in cron.d
+        stat:
+          path: "{{ item }}"
+        with_items: "{{ lookup('fileglob', '/etc/cron.d/*', wantlist=True) }}"
+        register: cron_d_files
+
+      - name: Set permissions for existing cron.d files
+        file:
+          path: "{{ item.stat.path }}"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+        with_items: "{{ cron_d_files.results }}"
+        when: item.stat.exists
+
+      - name: Set secure permissions for grub.cfg
+        file:
+          path: "/boot/grub/grub.cfg"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Initialize AIDE database
+        command: "aide --init --config /etc/aide/aide.conf"
+
+      - name: Move the AIDE database to default location
+        command: "cp -p /var/lib/aide/aide.db.new /var/lib/aide/aide.db"
+
+      - name: Ensure AIDE excludes specific directories
+        blockinfile:
+          path: "/etc/aide/aide.conf"
+          block: |
+            !/var/log
+            !/var/lib/aide
+            !/var/lib/apt
+            !/var/lib/dpkg
+            !/var/cache
+            !/run
+
+# Monitoring and Logging
+
+      - name: Add external logging configuration
+        lineinfile:
+          path: /etc/rsyslog.conf
+          line: "*.* @{{ external_log_host }}"
+          state: present
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: Update auditd configuration
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file = .*'
+          line: 'max_log_file = 50'
+
+      - name: Ensure audit logs are rotated
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file_action = .*'
+          line: 'max_log_file_action = rotate'
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/admin/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Make sure auditd is started and enabled
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Configure logrotate for syslog
+        copy:
+          dest: /etc/logrotate.d/syslog
+          content: |
+            /var/log/syslog {
+                daily
+                rotate 7
+                compress
+                missingok
+                notifempty
+            }
+
+# Advanced Layer
+
+      - name: Start App Armor service
+        systemd:
+          name: apparmor
+          state: started
+          enabled: true
+
+      - name: Configure unattended-upgrades
+        shell: "echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections"
+
+      - name: Configure unattended-upgrades
+        shell: "dpkg-reconfigure -f noninteractive unattended-upgrades"
+
+# Restart Host
+
+      - name: Reboot the system
+        reboot:
+          msg: "Reboot initiated by Ansible for system hardening changes."
+          pre_reboot_delay: 10
+          post_reboot_delay: 30
+          reboot_timeout: 300
+

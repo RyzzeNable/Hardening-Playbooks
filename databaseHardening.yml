@@ -1,0 +1,714 @@
+---
+  - name: Database Hardning One
+    hosts: database
+    become: yes
+    vars:
+      backup_nameservers:
+        - "8.8.8.8"
+        - "8.8.4.4"
+      protocols_to_disable:
+        - dccp /bin/true
+        - sctp /bin/true
+        - rds /bin/true
+        - tipc /bin/true
+        - firewire-core /bin/true
+        - firewire-ohci /bin/true
+      external_log_host: "192.168.84.133"
+      grub_plain_password: "#tomas123"
+      config_lines:
+        - { regex: '^ENCRYPT_METHOD', line: 'ENCRYPT_METHOD SHA512' }
+        - { regex: '^SHA_CRYPT_MIN_ROUNDS', line: 'SHA_CRYPT_MIN_ROUNDS 5000' }
+        - { regex: '^SHA_CRYPT_MAX_ROUNDS', line: 'SHA_CRYPT_MAX_ROUNDS 5000' }
+        - { regex: '^PASS_MIN_DAYS', line: 'PASS_MIN_DAYS 7' }
+        - { regex: '^PASS_MAX_DAYS', line: 'PASS_MAX_DAYS 90' }
+        - { regex: '^UMASK', line: 'UMASK 027' }
+      mysql_repo_url: "https://dev.mysql.com/get/mysql84-community-release-el9-1.noarch.rpm"
+      mysql_repo_file: "mysql84-community-release-el9-1.noarch.rpm"
+      mysql_root_password: "#Tomas1234567"
+      mysql_admin_user: "admin"
+      mysql_admin_password: "!Adm1n232454"
+      mysql_db_name: "webserver"
+      mysql_config_file: "/etc/my.cnf"
+    tasks:
+
+# Operative System Hardning
+
+      - name: Get the home directory
+        command: "bash -c 'echo ~{{ ansible_user }}'"
+        register: home_dir
+
+      - name: Download MySQL repository file
+        command: "curl -sSLO {{ mysql_repo_url }}"
+
+      - name: Install MySQL repository RPM
+        command: "rpm -ivh {{ mysql_repo_file }}"
+
+      - name: Update the dnf package index
+        command: "dnf update -y"
+
+      - name: Remove unnecessary packages
+        dnf:
+          name: "{{ item }}"
+          state: absent
+        loop:
+          - xinetd
+          - nis
+          - yp-tools
+          - tftpd
+          - atftpd
+          - tftpd-hpa
+          - telnetd
+          - rsh-server
+          - rsh-redone-server
+          - netcat
+
+      - name: Enable EPEL repository
+        yum:
+          name: epel-release
+          state: present
+
+      - name: Install necessary packages
+        dnf:
+          name:
+            - fail2ban
+            - nftables
+            - aide
+            - audit
+            - rsyslog
+            - clamav
+            - clamav-server
+            - clamav-data
+            - clamav-update
+            - clamav-filesystem
+            - clamav-scanner-systemd
+            - clamav-devel
+            - clamav-lib
+            - clamav-server-systemd
+            - gcc
+            - ca-certificates
+            - python3
+            - python3-pip
+            - mysql-server
+            - policycoreutils-python-utils
+            - arpwatch
+            - usbguard
+            - libselinux-utils
+            - dnf-automatic
+            - sysstat
+            - git
+            - gcc-c++
+          state: present
+
+      - name: Get lynis
+        command: git clone https://github.com/CISOfy/lynis "{{ home_dir.stdout }}/Lynis/"
+
+      - name: Install PyMySQL adn cryptography
+        pip:
+          name:
+            - PyMySQL
+            - cryptography
+
+      - name: Install pexpect
+        pip:
+          name: pexpect
+          state: latest
+
+      - name: Ensure SELinux is enforcing
+        command: "setenforce 1"
+        when: ansible_selinux.status != "enforcing"
+
+      - name: Configure SELinux to enforce mode persistently
+        lineinfile:
+          path: /etc/selinux/config
+          regexp: '^SELINUX='
+          line: 'SELINUX=enforcing'
+
+      - name: Configure dnf-automatic to enable automatic updates
+        lineinfile:
+          path: /etc/dnf/automatic.conf
+          regexp: '^apply_updates = .*'
+          line: 'apply_updates = yes'
+
+      - name: Enable and start dnf-automatic timer
+        systemd:
+          name: dnf-automatic.timer
+          enabled: true
+          state: started
+
+      - name: Stop and disable firewalld
+        systemd:
+          name: firewalld
+          state: stopped
+          enabled: no
+
+      - name: Remove firewalld
+        package:
+          name: firewalld
+          state: absent
+
+      - name: Generate hashed GRUB password
+        expect:
+          command: grub2-mkpasswd-pbkdf2
+          responses:
+            "Enter password:": "{{ grub_plain_password }}"
+            "Reenter password:": "{{ grub_plain_password }}"
+        register: grub_password_hash
+
+      - name: Set GRUB password in configuration
+        blockinfile:
+          path: /etc/grub.d/40_custom
+          insertafter: EOF
+          block: |
+            set superusers="root"
+            password_pbkdf2 root {{ grub_password_hash.stdout | regex_search('grub2.pbkdf2.*') }}
+
+      - name: Update GRUB configuration
+        command: grub2-mkconfig -o /boot/grub2/grub.cfg
+
+      - name: Disable core dumps
+        lineinfile:
+          path: /etc/security/limits.conf
+          line: '*    hard    core    0'
+          state: present
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Enable clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: started
+          enabled: yes
+
+      - name: Add backup nameservers to /etc/resolv.conf
+        lineinfile:
+          path: /etc/resolv.conf
+          line: "nameserver {{ item }}"
+          state: present
+        loop: "{{ backup_nameservers }}"
+
+      - name: Create modprobe blacklist file for USB storage
+        copy:
+          dest: /etc/modprobe.d/blacklist-usb-storage.conf
+          content: |
+            install usb-storage /bin/true
+            blacklist usb-storage /bin/true
+
+      - name: Start MySQL service
+        service:
+          name: mysqld
+          state: started
+          enabled: true
+
+      - name: Get temporary root password from the MySQL log
+        shell: "grep 'temporary password' /var/log/mysqld.log | tail -n 1 | awk '{print $NF}'"
+        register: temp_password
+        changed_when: false
+
+      - name: Reset expired root password
+        shell: >
+          mysql -u root -p"{{ temp_password.stdout }}"
+          --connect-expired-password
+          -e "ALTER USER 'root'@'localhost' IDENTIFIED BY '{{ mysql_root_password }}';"
+
+      - name: Remove anonymous users
+        mysql_user:
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+          name: ''
+          column_case_sensitive: false
+          host: localhost
+          state: absent
+
+      - name: Remove test database
+        mysql_db:
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+          name: test
+          state: absent
+
+      - name: Reload privilege tables
+        mysql_query:
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+          query: "FLUSH PRIVILEGES;"
+
+      - name: Disable remote root login
+        mysql_user:
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+          name: root
+          host: '%'
+          state: absent
+
+      - name: Restart MySQL
+        service:
+          name: mysqld
+          state: restarted
+
+      - name: Create database
+        mysql_db:
+          name: "{{ mysql_db_name }}"
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+          state: present
+
+      - name: Add sample data to database
+        copy:
+          src: "/etc/ansible/playbooks/database/mysql.sql"
+          dest: "/tmp/mysql.sql"
+
+      - name: Insert data into database
+        mysql_db:
+          name: "{{ mysql_db_name }}"
+          state: import
+          target: "/tmp/mysql.sql"
+          login_user: root
+          login_password: "{{ mysql_root_password }}"
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/nftables.conf
+          dest: /etc/sysconfig/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Add the custom SSH port to SELinux
+        command: semanage port -a -t ssh_port_t -p tcp 3025
+        ignore_errors: true
+
+      - name: Restart SSH service
+        systemd:
+          name: sshd
+          state: restarted
+          enabled: yes
+
+      - name: Wait for the SSH service to restart on the new port
+        wait_for:
+          host: "{{ inventory_hostname }}"
+          port: 3025
+          delay: 15
+          timeout: 30
+          state: started
+
+      - name: Reset connection for the new SSH port
+        meta: reset_connection
+
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Start and enable USBGuard service
+        systemd:
+          name: usbguard
+          enabled: yes
+          state: started
+
+      - name: Generate default USBGuard policy
+        command: "usbguard generate-policy"
+        register: usbguard_policy
+
+      - name: Save the generated policy to rules.conf
+        copy:
+          content: "{{ usbguard_policy.stdout }}"
+          dest: /etc/usbguard/rules.conf
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Restart USBGuard service
+        systemd:
+          name: usbguard
+          state: restarted
+
+      - name: Configure login.defs
+        lineinfile:
+          path: /etc/login.defs
+          regexp: "{{ item.regex }}"
+          line: "{{ item.line }}"
+          state: present
+        loop: "{{ config_lines }}"
+
+      - name: Create modprobe blacklist file for USB storage
+        copy:
+          dest: /etc/modprobe.d/blacklist-usb-storage.conf
+          content: |
+            install usb-storege /bin/true
+            blacklist usb-storage /bin/true
+
+      - name: Create protocols blacklist file
+        command: touch /etc/modprobe.d/blacklist-protocols.conf
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "blacklist {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Create modprobe blacklist file
+        lineinfile:
+          path: /etc/modprobe.d/blacklist-protocols.conf
+          line: "install {{ item }}"
+          state: present
+        with_items: "{{ protocols_to_disable }}"
+
+      - name: Create cramfs.conf file
+        command: "touch /etc/modprobe.d/cramfs.conf"
+
+      - name: Add cramfs to modprobe blacklist
+        lineinfile:
+          path: "/etc/modprobe.d/cramfs.conf"
+          line: "install cramfs /bin/false"
+          state: present
+
+      - name: Ensure sysstat is running
+        service:
+          name: sysstat
+          state: started
+          enabled: true
+
+      - name: Add audit rules for deleted files
+        lineinfile:
+          path: /etc/audit/rules.d/audit.rules
+          line: '-w /tmp -p wa -k delete_watch'
+          state: present
+
+      - name: Check if Bluetooth service is enabled
+        command: systemctl is-enabled bluetooth.service
+        register: bluetooth_status
+        ignore_errors: true
+
+      - name: Disable Bluetooth service if it is enabled
+        systemd:
+          name: bluetooth.service
+          state: stopped
+          enabled: no
+        when: bluetooth_status.rc == 0
+        ignore_errors: true
+
+# User and Access management
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        systemd:
+          name: nftables
+          state: started
+          enabled: yes
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Apply nftables configuration
+        command: nft -f /etc/sysconfig/nftables.conf
+
+      - name: Get users with password
+        shell: "awk -F: '{ if ($2 != \"*\" && $2 != \"!\" ) print $1 }' /etc/shadow"
+        register: users
+
+      - name: Set account expiration dates
+        user:
+          name: "{{ item }}"
+          expires: 1735689600
+        loop: "{{ users.stdout_lines }}"
+
+      - name: Ensure proper permissions for /etc/passwd
+        file:
+          path: /etc/passwd
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure proper permissions for /etc/shadow
+        file:
+          path: /etc/shadow
+          owner: root
+          group: root
+          mode: '0640'
+
+      - name: Set minimum password length
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minlen = .*'
+          line: 'minlen = 9'
+
+      - name: Set password complexity
+        lineinfile:
+          path: "/etc/security/pwquality.conf"
+          regexp: '^#? minclass = .*'
+          line: 'minclass = 3'
+
+      - name: Add a banner to /etc/issue
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue"
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Add a banner to /etc/issue.net
+        copy:
+          content: |
+            **************************************************************************
+                WARNING: Unauthorized access to this system is prohibited.
+                All activities are monitored and recorded.
+                Disconnect immediately if you are not an authorized user.
+            **************************************************************************
+          dest: "/etc/issue.net"
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Add rounds to PAM configuration
+        lineinfile:
+          path: /etc/security/pwquality.conf
+          line: 'rounds=5000'
+          state: present
+
+# Network Layer Hardening
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply sysctl configuration
+        shell: sysctl -p
+
+      - name: Copy Fail2Ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Ensure allowipv6 is set to 'no' in Fail2Ban configuration
+        lineinfile:
+          path: "/etc/fail2ban/fail2ban.conf"
+          regexp: '^#?allowipv6 = .*'
+          line: 'allowipv6 = no'
+          state: present
+
+      - name: Start and enable Fail2Ban service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+      - name: Disable promiscuous mode on interface ens160
+        command: "ip link set ens160 promisc off"
+        ignore_errors: true
+
+      - name: Configure split resolving
+        blockinfile:
+          path: /etc/hosts
+          block: |
+            127.0.1.1 {{ ansible_hostname }}
+          state: present
+
+# Application Layer Hardening
+
+      - name: Locate PHP configuration files
+        shell: grep -l "allow_url_fopen" /etc/php.ini /etc/php.d/*.ini || true
+        register: php_ini_files
+
+      - name: Disable allow_url_fopen in each PHP configuration file
+        lineinfile:
+          path: "{{ item }}"
+          regexp: '^allow_url_fopen ='
+          line: 'allow_url_fopen = Off'
+          state: present
+        loop: "{{ php_ini_files.stdout_lines }}"
+
+# Application Dependencies Hardning
+
+      - name: Change permissions for sudoers.d files
+        command: "chmod -R 750 /etc/sudoers.d"
+
+      - name: Restrict compiler access
+        file:
+          path: "{{ item }}"
+          mode: '0700'
+        with_items:
+          - /usr/bin/gcc
+          - /usr/bin/g++
+          - /usr/bin/cc
+
+      - name: Set owner and permissions for cron directories
+        file:
+          path: "{{ item }}"
+          owner: root
+          group: root
+          mode: '0700'
+          state: directory
+        loop:
+          - /etc/cron.d
+          - /etc/cron.daily
+          - /etc/cron.hourly
+          - /etc/cron.weekly
+          - /etc/cron.monthly
+
+      - name: Set owner and permissions for crontab file
+        file:
+          path: "/etc/crontab"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Get list of files in cron.d
+        find:
+          paths: /etc/cron.d
+          file_type: file
+        register: cron_d_files
+
+      - name: Set permissions for existing cron.d files
+        file:
+          path: "{{ item.path }}"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+        loop: "{{ cron_d_files.files }}"
+
+      - name: Set secure permissions for grub.cfg
+        file:
+          path: "/boot/grub2/grub.cfg"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Initialize AIDE database
+        command: "aide --init --config /etc/aide.conf"
+
+      - name: Move the AIDE database to default location
+        command: "cp -p /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz"
+
+      - name: Update AIDE database
+        command: aide --update
+
+      - name: Ensure AIDE excludes specific directories
+        blockinfile:
+          path: "/etc/aide.conf"
+          block: |
+            !/var/log
+            !/var/lib/aide
+            !/var/cache
+            !/run
+
+# Monitoring and Logging
+
+      - name: Add external logging configuration
+        lineinfile:
+          path: /etc/rsyslog.conf
+          line: "*.* @{{ external_log_host }}"
+          state: present
+
+      - name: Restart rsyslog service
+        systemd:
+          name: rsyslog
+          state: restarted
+
+      - name: Update auditd configuration for maximum log file size
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file = .*'
+          line: 'max_log_file = 50'
+
+      - name: Ensure audit logs are rotated
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file_action = .*'
+          line: 'max_log_file_action = rotate'
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/database/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Start and enable auditd service
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Configure logrotate for syslog
+        copy:
+          dest: /etc/logrotate.d/syslog
+          content: |
+            /var/log/messages {
+                daily
+                rotate 7
+                compress
+                missingok
+                notifempty
+            }
+
+# Advanced Layer
+
+      - name: Ensure SELinux is enforcing
+        command: "setenforce 1"
+        when: ansible_selinux.status != "enforcing"
+
+      - name: Configure SELinux to enforce mode persistently
+        lineinfile:
+          path: /etc/selinux/config
+          regexp: '^SELINUX='
+          line: 'SELINUX=enforcing'
+
+      - name: Configure dnf-automatic to enable automatic updates
+        lineinfile:
+          path: /etc/dnf/automatic.conf
+          regexp: '^apply_updates = .*'
+          line: 'apply_updates = yes'
+
+      - name: Enable and start dnf-automatic timer
+        systemd:
+          name: dnf-automatic.timer
+          enabled: true
+          state: started
+
+# Restart Host
+
+      - name: Reboot the system
+        reboot:
+          msg: "Reboot initiated by Ansible for system hardening changes."
+          pre_reboot_delay: 10
+          post_reboot_delay: 30
+          reboot_timeout: 300
+
+
+
+
