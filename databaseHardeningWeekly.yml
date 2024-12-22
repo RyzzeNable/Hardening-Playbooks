@@ -1,0 +1,239 @@
+---
+  - name: Database Hardning One
+    hosts: database
+    become: yes
+    gather_facts: no
+    tasks:
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Update the dnf package index
+        command: "dnf update -y"
+
+      - name: Remove unnecessary packages
+        dnf:
+          name: "{{ item }}"
+          state: absent
+        loop:
+          - xinetd
+          - nis
+          - yp-tools
+          - tftpd
+          - atftpd
+          - tftpd-hpa
+          - telnetd
+          - rsh-server
+          - rsh-redone-server
+          - netcat
+
+      - name: Enable EPEL repository
+        yum:
+          name: epel-release
+          state: present
+
+      - name: Install necessary packages
+        dnf:
+          name:
+            - fail2ban
+            - nftables
+            - aide
+            - audit
+            - rsyslog
+            - clamav
+            - clamav-server
+            - clamav-data
+            - clamav-update
+            - clamav-filesystem
+            - clamav-scanner-systemd
+            - clamav-devel
+            - clamav-lib
+            - clamav-server-systemd
+            - gcc
+            - ca-certificates
+            - python3
+            - python3-pip
+            - mysql-server
+            - policycoreutils-python-utils
+            - arpwatch
+            - usbguard
+            - libselinux-utils
+            - dnf-automatic
+            - sysstat
+            - git
+            - gcc-c++
+          state: present
+
+      - name: Install PyMySQL adn cryptography
+        pip:
+          name:
+            - PyMySQL
+            - cryptography
+
+      - name: Install pexpect
+        pip:
+          name: pexpect
+          state: latest
+
+      - name: Ensure SELinux is enforcing
+        command: "setenforce 1"
+
+      - name: Configure SELinux to enforce mode persistently
+        lineinfile:
+          path: /etc/selinux/config
+          regexp: '^SELINUX='
+          line: 'SELINUX=enforcing'
+
+      - name: Configure dnf-automatic to enable automatic updates
+        lineinfile:
+          path: /etc/dnf/automatic.conf
+          regexp: '^apply_updates = .*'
+          line: 'apply_updates = yes'
+
+      - name: Enable and start dnf-automatic timer
+        systemd:
+          name: dnf-automatic.timer
+          enabled: true
+          state: started
+
+      - name: Stop and disable firewalld
+        systemd:
+          name: firewalld
+          state: stopped
+          enabled: no
+        ignore_errors: yes
+
+      - name: Remove firewalld
+        package:
+          name: firewalld
+          state: absent
+        ignore_errors: yes
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Enable clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: started
+          enabled: yes
+
+      - name: Start MySQL service
+        service:
+          name: mysqld
+          state: started
+          enabled: true
+
+      - name: Start and enable USBGuard service
+        systemd:
+          name: usbguard
+          enabled: yes
+          state: started
+
+      - name: Ensure sysstat is running
+        service:
+          name: sysstat
+          state: started
+          enabled: true
+
+      - name: Check if Bluetooth service is enabled
+        command: systemctl is-enabled bluetooth.service
+        register: bluetooth_status
+        ignore_errors: true
+
+      - name: Disable Bluetooth service if it is enabled
+        systemd:
+          name: bluetooth.service
+          state: stopped
+          enabled: no
+        when: bluetooth_status.rc == 0
+        ignore_errors: true
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/nftables.conf
+          dest: /etc/sysconfig/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        systemd:
+          name: nftables
+          state: started
+          enabled: yes
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Apply nftables configuration
+        command: nft -f /etc/sysconfig/nftables.conf
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply sysctl configuration
+        shell: sysctl -p
+
+      - name: Copy Fail2Ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/database/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Start and enable Fail2Ban service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+      - name: Restart rsyslog service
+        systemd:
+          name: rsyslog
+          state: restarted
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/database/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Start and enable auditd service
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Enable and start dnf-automatic timer
+        systemd:
+          name: dnf-automatic.timer
+          enabled: true
+          state: started

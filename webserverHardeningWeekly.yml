@@ -1,0 +1,301 @@
+---
+  - name: Admin Hardning One
+    hosts: webserver
+    become: yes
+    gather_facts: no
+    tasks:
+
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Update the apt package index
+        apt:
+          update_cache: yes
+
+      - name: Upgrade all packages to the latest version
+        apt:
+          upgrade: dist
+
+      - name: Remove unnecessary packages
+        apt:
+          autoremove: yes
+
+      - name: Clean up unused package cache
+        apt:
+          autoclean: yes
+
+      - name: Remove unnecessary packages
+        shell: "apt autoremove --purge -y"
+
+      - name: Remove unsecure services
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server -y"
+
+      - name: Stop and disable services
+        systemd:
+          name: "{{ item }}"
+          state: stopped
+          enabled: no
+        loop:
+          - ModemManager.service
+          - cups-browsed.service
+          - postfix@-.service
+          - wpa_supplicant.service
+          - avahi-daemon.service
+        ignore_errors: yes
+
+      - name: Install needed packages
+        command: "apt-get install nftables fail2ban nginx openssl certbot debsums aptitude apt-show-versions apt-listbugs python3-certbot-nginx apparmor apparmor-utils unattended-upgrades libpam-tmpdir apt-listbugs needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon bison build-essential ca-certificates curl dh-autoreconf doxygen flex gawk git iputils-ping libcurl4-gnutls-dev libexpat1-dev libgeoip-dev liblmdb-dev libpcre3-dev libssl-dev libtool libxml2 libxml2-dev libyajl-dev locales lua5.3-dev pkg-config wget zlib1g-dev libxslt1-dev libgd-dev libperl-dev libpwquality-tools aide arpwatch -y"
+
+      - name: Purge old/removed packages
+        command: "aptitude purge '~c' -y"
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/nftables.conf
+          dest: /etc/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Update signature database
+        command: "sudo freshclam"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          enabled: yes
+          state: started
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        command: "systemctl start nftables"
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Enable nftables service
+        command: "systemctl enable nftables"
+
+      - name: Apply nftables configuration
+        command: "nft -f /etc/nftables.conf"
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply configuration
+        shell: "sysctl -p"
+
+      - name: Copy fail2ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Start and enabale fail2ban  service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/webserver/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Make sure auditd is started and enabled
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Start App Armor service
+        systemd:
+          name: apparmor
+          state: started
+          enabled: true
+
+      - name: Change premissions html directory
+        command: "chmod -R 750 /var/www/html"
+
+      - name: Change premisions sudoers.d file
+        command: "chmod -R 750 /etc/sudoers.d"
+
+      - name: Remove README file
+        command: "rm /etc/sudoers.d/README"
+        ignore_errors: yes
+
+      - name: Restrict directory premissions
+        command: "chown -R www-data:www-data /var/www/html"
+
+      - name: Set owner and permissions for cron directories
+        file:
+          path: "{{ item }}"
+          owner: root
+          group: root
+          mode: '0700'
+          state: directory
+        with_items:
+          - /etc/cron.d
+          - /etc/cron.daily
+          - /etc/cron.hourly
+          - /etc/cron.weekly
+          - /etc/cron.monthly
+
+      - name: Set owner and permissions for crontab file
+        file:
+          path: "/etc/crontab"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Get list of files in cron.d
+        stat:
+          path: "{{ item }}"
+        with_items: "{{ lookup('fileglob', '/etc/cron.d/*', wantlist=True) }}"
+        register: cron_d_files
+
+      - name: Set permissions for existing cron.d files
+        file:
+          path: "{{ item.stat.path }}"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+        with_items: "{{ cron_d_files.results }}"
+        when: item.stat.exists
+
+      - name: Set secure permissions for grub.cfg
+        file:
+          path: "/boot/grub/grub.cfg"
+          owner: root
+          group: root
+          mode: '0600'
+          state: file
+
+      - name: Initialize AIDE database
+        command: "aide --init --config /etc/aide/aide.conf"
+
+      - name: Move the AIDE database to default location
+        command: "cp -p /var/lib/aide/aide.db.new /var/lib/aide/aide.db"
+
+      - name: Ensure AIDE excludes specific directories
+        blockinfile:
+          path: "/etc/aide/aide.conf"
+          block: |
+            !/var/log
+            !/var/lib/aide
+            !/var/lib/apt
+            !/var/lib/dpkg
+            !/var/cache
+            !/run
+
+      - name: Add external logging configuration
+        lineinfile:
+          path: /etc/rsyslog.conf
+          line: "*.* @{{ external_log_host }}"
+          state: present
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: Update auditd configuration
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file = .*'
+          line: 'max_log_file = 50'
+
+      - name: Ensure audit logs are rotated
+        lineinfile:
+          path: "/etc/audit/auditd.conf"
+          regexp: '^max_log_file_action = .*'
+          line: 'max_log_file_action = rotate'
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/webserver/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Make sure auditd is started and enabled
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Configure logrotate for syslog
+        copy:
+          dest: /etc/logrotate.d/syslog
+          content: |
+            /var/log/syslog {
+                daily
+                rotate 7
+                compress
+                missingok
+                notifempty
+            }
+
+
+      - name: Start App Armor service
+        systemd:
+          name: apparmor
+          state: started
+          enabled: true
+
+      - name: Protect nginx with APP-ARMOR
+        shell: "aa-enforce /etc/apparmor.d/usr.sbin.nginx"
+
+      - name: Configure unattended-upgrades
+        shell: "echo unattended-upgrades unattended-upgrades/enable_auto_updates boolean true | debconf-set-selections"
+
+      - name: Configure unattended-upgrades
+        shell: "dpkg-reconfigure -f noninteractive unattended-upgrades"
+
+      - name: Reload Nginx
+        service:
+          name: nginx
+          state: reloaded
+
+      - name: Restart Host
+        shell: "reboot"

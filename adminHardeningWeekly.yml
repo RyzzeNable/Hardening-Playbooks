@@ -1,0 +1,168 @@
+---
+  - name: Admin Hardning One
+    hosts: admin
+    become: yes
+    gather_facts: no
+    tasks:
+
+      - name: Update SSH port in Ansible connection
+        set_fact:
+          ansible_ssh_port: 3025
+
+      - name: Update the apt package index
+        apt:
+          update_cache: yes
+
+      - name: Upgrade all packages to the latest version
+        apt:
+          upgrade: dist
+
+      - name: Remove unnecessary packages
+        apt:
+          autoremove: yes
+
+      - name: Clean up unused package cache
+        apt:
+          autoclean: yes
+
+      - name: Remove unnecessary packages
+        shell: "apt autoremove --purge -y"
+
+      - name: Remove unsecure services
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server -y"
+
+      - name: Stop and disable services
+        systemd:
+          name: "{{ item }}"
+          state: stopped
+          enabled: no
+        loop:
+          - ModemManager.service
+          - cups-browsed.service
+          - postfix@-.service
+          - wpa_supplicant.service
+          - avahi-daemon.service
+        ignore_errors: yes
+
+      - name: Install needed packages
+        command: "apt-get install nftables fail2ban debsums aptitude apt-show-versions apparmor apparmor-utils unattended-upgrades libpam-tmpdir needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon build-essential curl git aide arpwatch rkhunter -y"
+
+      - name: Purge old/removed packages
+        command: "aptitude purge '~c' -y"
+
+      - name: Copy nftables configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/nftables.conf
+          dest: /etc/nftables.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          state: stopped
+
+      - name: Update signature database
+        command: "sudo freshclam"
+
+      - name: Stop clamav-freshclam
+        systemd:
+          name: clamav-freshclam
+          enabled: yes
+          state: started
+
+      - name: Update rkhunter database
+        command: "rkhunter --update"
+        ignore_errors: yes
+
+      - name: Ensure CUPS service is stopped
+        systemd:
+          name: cups
+          state: stopped
+          enabled: no
+        ignore_errors: yes
+
+      - name: Mask the CUPS service to prevent it from starting
+        systemd:
+          masked: yes
+        ignore_errors: yes
+
+      - name: Copy sshd configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sshd_config
+          dest: /etc/ssh/sshd_config
+          owner: root
+          group: root
+          mode: '0600'
+
+      - name: Flush current nftables rules
+        command: nft flush ruleset
+
+      - name: Enable and start nftables service
+        command: "systemctl start nftables"
+        async: 30
+        poll: 5
+        register: nftables_result
+
+      - name: Enable nftables service
+        command: "systemctl enable nftables"
+
+      - name: Apply nftables configuration
+        command: "nft -f /etc/nftables.conf"
+
+      - name: Copy sysctl configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/sysctl.conf
+          dest: /etc/sysctl.conf
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Apply configuration
+        shell: "sysctl -p"
+
+      - name: Copy fail2ban local configuration file
+        copy:
+          src: /etc/ansible/playbooks/admin/jail.local
+          dest: /etc/fail2ban/jail.local
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Start and enabale fail2ban  service
+        systemd:
+          name: fail2ban
+          enabled: yes
+          state: started
+
+      - name: Start and enable arpwatch service
+        systemd:
+          name: arpwatch
+          enabled: yes
+          state: started
+
+      - name: Restart rsyslog service
+        service:
+          name: rsyslog
+          state: restarted
+
+      - name: Copy audit.rules configuration file
+        copy:
+          src: "/etc/ansible/playbooks/webserver/audit.rules"
+          dest: "/etc/audit/rules.d/audit.rules"
+          owner: root
+          group: root
+          mode: '0644'
+
+      - name: Make sure auditd is started and enabled
+        systemd:
+          name: auditd
+          state: started
+          enabled: true
+
+      - name: Start App Armor service
+        systemd:
+          name: apparmor
+          state: started
+          enabled: true
