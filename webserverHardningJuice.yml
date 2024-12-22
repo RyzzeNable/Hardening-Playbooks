@@ -1,6 +1,6 @@
 ---
   - name: Webserver Hardning One
-    hosts: webserver
+    hosts: webserverJuice
     become: yes
     vars:
       backup_nameservers:
@@ -45,14 +45,36 @@
         apt:
           autoclean: yes
 
+      - name: Install required dependencies
+        apt:
+          name:
+            - ca-certificates
+            - curl
+          state: present
+
       - name: Remove unnecessary packages
         shell: "apt autoremove --purge -y"
 
       - name: Remove unsecure services
-        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server netcat -y"
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server -y"
+
+      - name: Add Docker GPG key (Debian)
+        apt_key:
+          url: https://download.docker.com/linux/debian/gpg
+          state: present
+
+      - name: Add Docker repository (Debian)
+        apt_repository:
+          repo: 'deb [arch=amd64] https://download.docker.com/linux/debian {{ ansible_distribution_release }} stable'
+          state: present
+
+      - name: Install Docker (Debian)
+        apt:
+          name: docker-ce
+          state: present
 
       - name: Install needed packages
-        command: "apt-get install nftables fail2ban nginx openssl certbot debsums aptitude apt-show-versions apt-listbugs python3-certbot-nginx apparmor apparmor-utils unattended-upgrades libpam-tmpdir apt-listbugs needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon bison build-essential ca-certificates curl dh-autoreconf doxygen flex gawk git iputils-ping libcurl4-gnutls-dev libexpat1-dev libgeoip-dev liblmdb-dev libpcre3-dev libssl-dev libtool libxml2 libxml2-dev libyajl-dev locales lua5.3-dev pkg-config wget zlib1g-dev libxslt1-dev libgd-dev libperl-dev libpwquality-tools aide arpwatch curl ca-certificates -y"
+        command: "apt-get install nftables fail2ban nginx openssl certbot debsums aptitude apt-show-versions apt-listbugs python3-certbot-nginx apparmor apparmor-utils unattended-upgrades libpam-tmpdir apt-listbugs needrestart python3-pip python3-pexpect libpam-passwdqc debsums acct auditd rsyslog auditd clamav clamav-daemon bison build-essential dh-autoreconf doxygen flex gawk git iputils-ping libcurl4-gnutls-dev libexpat1-dev libgeoip-dev liblmdb-dev libpcre3-dev libssl-dev libtool libxml2 libxml2-dev libyajl-dev locales lua5.3-dev pkg-config wget zlib1g-dev libxslt1-dev libgd-dev libperl-dev libpwquality-tools aide arpwatch curl ca-certificates docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin -y"
 
       - name: Purge old/removed packages
         command: "aptitude purge '~c' -y"
@@ -203,32 +225,6 @@
           enabled: yes
           state: started
 
-      - name: Create the directory for Docker keyrings
-        file:
-          path: /etc/apt/keyrings
-          state: directory
-          mode: '0755'
-
-      - name: Download Docker's official GPG key
-        get_url:
-          url: https://download.docker.com/linux/debian/gpg
-          dest: /etc/apt/keyrings/docker.asc
-          mode: '0644'
-
-      - name: Add Docker repository to APT sources
-        copy:
-          content: |
-            deb [arch={{ ansible_architecture }} signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(lsb_release -cs) stable
-          dest: /etc/apt/sources.list.d/docker.list
-
-      - name: Update APT package index after adding Docker repository
-        apt:
-          update_cache: yes
-
-      - name: Install Docker Last Version
-        command: "apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin"
-
-
 # User and Access management
 
       - name: Copy sshd configuration file
@@ -258,6 +254,8 @@
       - name: Update SSH port in Ansible connection
         set_fact:
           ansible_ssh_port: 3025
+
+# Activate nftables
 
       - name: Flush current nftables rules
         command: nft flush ruleset
@@ -302,6 +300,14 @@
           group: shadow
           mode: '0640'
 
+#      - name: Copy common-auth configuration file
+#        copy:
+#          src: /etc/ansible/playbooks/webserver/common-auth
+#          dest: /etc/pam.d/common-auth
+#          owner: root
+#          group: root
+#          mode: '0644'
+
       - name: Set minimum password length
         lineinfile:
           path: "/etc/security/pwquality.conf"
@@ -339,6 +345,7 @@
           owner: root
           group: root
           mode: '0600'
+
 
 # Network Layer Hardning
 
@@ -644,7 +651,10 @@
         command: "chmod -R 750 /var/www/html"
 
       - name: Change premisions sudoers.d file
-        command: "chmod -R 440 /etc/sudoers.d"
+        command: "chmod -R 750 /etc/sudoers.d"
+
+      - name: Remove README file
+        command: "rm /etc/sudoers.d/README"
 
       - name: Restrict directory premissions
         command: "chown -R www-data:www-data /var/www/html"
@@ -711,6 +721,7 @@
             !/var/lib/dpkg
             !/var/cache
             !/run
+
 
 # Monitoring and Logging
 
@@ -791,4 +802,3 @@
 
       - name: Restart Host
         shell: "reboot"
-
