@@ -60,7 +60,6 @@
           - telnetd
           - rsh-server
           - rsh-redone-server
-          - netcat
 
       - name: Enable EPEL repository
         yum:
@@ -97,6 +96,7 @@
             - sysstat
             - git
             - gcc-c++
+            - psacct
           state: present
 
       - name: Get lynis
@@ -398,6 +398,9 @@
         when: bluetooth_status.rc == 0
         ignore_errors: true
 
+      - name: Enable process accounting
+        command: "systemctl enable --now psacct"
+
 # User and Access management
 
       - name: Flush current nftables rules
@@ -552,6 +555,10 @@
 
       - name: Change permissions for sudoers.d files
         command: "chmod -R 750 /etc/sudoers.d"
+
+      - name: Remove README file
+        command: "rm /etc/sudoers.d/README"
+        ignore_errors: yes
 
       - name: Restrict compiler access
         file:
@@ -708,7 +715,3 @@
           pre_reboot_delay: 10
           post_reboot_delay: 30
           reboot_timeout: 300
-
-
-
-
