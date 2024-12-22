@@ -49,7 +49,7 @@
         shell: "apt autoremove --purge -y"
 
       - name: Remove unsecure services
-        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server netcat -y"
+        shell: "apt-get --purge remove xinetd nis yp-tools tftpd atftpd tftpd-hpa telnetd rsh-server rsh-redone-server -y"
 
       - name: Stop and disable services
         systemd:
@@ -287,18 +287,6 @@
           purge: yes
         ignore_errors: yes
 
-      - name: Ensure CUPS service is stopped
-        systemd:
-          name: cups
-          state: stopped
-          enabled: no
-        ignore_errors: yes
-
-      - name: Mask the CUPS service to prevent it from starting
-        systemd:
-          masked: yes
-        ignore_errors: yes
-
 # User and Access management
 
       - name: Copy sshd configuration file
@@ -349,6 +337,8 @@
       - name: Update SSH port in Ansible connection
         set_fact:
           ansible_ssh_port: 3025
+
+# Activate nftables
 
       - name: Flush current nftables rules
         command: nft flush ruleset
@@ -431,6 +421,7 @@
           group: root
           mode: '0600'
 
+
 # Network Layer Hardning
 
       - name: Copy sysctl configuration file
@@ -471,6 +462,41 @@
           enabled: yes
           state: started
 
+      - name: Backup the current CUPS configuration file
+        copy:
+          src: /etc/cups/cupsd.conf
+          dest: /etc/cups/cupsd.conf.bak
+          backup: yes
+
+      - name: Modify CUPS configuration to restrict access to 192.168.84.0/24
+        lineinfile:
+          path: /etc/cups/cupsd.conf
+          regexp: '^#?(Order|Allow|Deny) from'
+          line: |
+            <Location />
+              Order deny,allow
+              Deny from all
+              Allow from 192.168.84.0/24
+            </Location>
+          insertafter: '^#Allow from all'
+      
+      - name: Restrict administrative access to CUPS
+        lineinfile:
+          path: /etc/cups/cupsd.conf
+          regexp: '^#?(Order|Allow|Deny) from'
+          line: |
+            <Location /admin>
+              Order deny,allow
+              Deny from all
+              Allow from 192.168.84.0/24
+            </Location>
+          insertafter: '^#Allow from all'
+      
+      - name: Restart CUPS service
+        systemd:
+          name: cups
+          state: restarted
+
 # Application layer Hardning
 
       - name: Locate PHP configuration files
@@ -490,8 +516,8 @@
       - name: Change premisions sudoers.d file
         command: "chmod -R 750 /etc/sudoers.d"
 
-      - name: Change permission README file
-        command: "chmod -R 750 /etc/sudoers.d/README"
+      - name: Remove README file
+        command: "rm /etc/sudoers.d/README"
 
       - name: Set owner and permissions for cron directories
         file:
@@ -629,4 +655,3 @@
           pre_reboot_delay: 10
           post_reboot_delay: 30
           reboot_timeout: 300
-
